@@ -34,7 +34,8 @@ def calculate_investment_projections(
     monthly_insurance, annual_tax_rate, monthly_rent, vacancy_rate,
     annual_appreciation, annual_rent_increase, holding_years,
     initial_repairs, ongoing_maintenance_pct, extra_payment_monthly=0,
-    cashflow_to_principal_pct=0
+    cashflow_to_principal_pct=0, loan_type="mortgage", closing_costs=0,
+    annual_balloon_payment=0
 ):
     """
     Calculate year-by-year investment projections.
@@ -42,6 +43,9 @@ def calculate_investment_projections(
     Args:
         extra_payment_monthly: Fixed extra monthly payment to principal
         cashflow_to_principal_pct: Percentage of positive cash flow to apply to principal (0-1)
+        loan_type: "mortgage" or "line_of_credit"
+        closing_costs: One-time closing costs added to initial investment
+        annual_balloon_payment: Extra lump sum payment at end of each year
 
     Returns DataFrame with yearly metrics.
     """
@@ -53,18 +57,21 @@ def calculate_investment_projections(
     monthly_rate = interest_rate / 12
     total_months = loan_years * 12
 
-    # Monthly mortgage payment
-    if interest_rate > 0:
-        monthly_mortgage = (loan_amount * (monthly_rate * (1 + monthly_rate) ** total_months)) / \
-                          (((1 + monthly_rate) ** total_months) - 1)
-    else:
-        monthly_mortgage = loan_amount / total_months
+    # Monthly mortgage payment (only for standard mortgage)
+    if loan_type == "mortgage":
+        if interest_rate > 0:
+            monthly_mortgage = (loan_amount * (monthly_rate * (1 + monthly_rate) ** total_months)) / \
+                              (((1 + monthly_rate) ** total_months) - 1)
+        else:
+            monthly_mortgage = loan_amount / total_months
+    else:  # Line of Credit - no fixed payment, just interest minimum
+        monthly_mortgage = 0  # Will calculate interest dynamically
 
     # Starting values
     current_property_value = purchase_price
     current_monthly_rent = monthly_rent
     remaining_balance = loan_amount
-    total_cash_invested = down_payment + initial_repairs
+    total_cash_invested = down_payment + initial_repairs + closing_costs
     cumulative_cash_flow = 0
     cumulative_extra_principal = 0
 
@@ -84,49 +91,85 @@ def calculate_investment_projections(
         # Effective rent (accounting for vacancy)
         effective_monthly_rent = current_monthly_rent * (1 - vacancy_rate)
 
-        # Monthly cash flow BEFORE extra principal
-        monthly_expenses = monthly_mortgage + monthly_property_tax + monthly_insurance + monthly_maintenance
-        monthly_cash_flow_gross = effective_monthly_rent - monthly_expenses
-
         # Loan paydown for the year with extra principal payments
-        principal_paid = 0
+        principal_paid = 0  # Regular principal only
+        interest_paid = 0
         total_extra_principal_this_year = 0
         temp_balance = year_start_balance
 
         for month in range(12):
             if temp_balance > 0:
-                # Regular mortgage payment
+                # Calculate interest for this month
                 interest_payment = temp_balance * monthly_rate
-                principal_payment = monthly_mortgage - interest_payment
+                interest_paid += interest_payment
+
+                if loan_type == "mortgage":
+                    # Standard mortgage - fixed payment
+                    principal_payment = monthly_mortgage - interest_payment
+                else:
+                    # Line of Credit - interest only, no automatic principal
+                    principal_payment = 0
 
                 # Extra principal from fixed monthly amount
                 extra_from_fixed = extra_payment_monthly
 
-                # Extra principal from cash flow (calculated each month based on current cash flow)
+                # Extra principal from cash flow percentage (applies to both mortgage and LOC)
                 extra_from_cashflow = 0
-                if monthly_cash_flow_gross > 0:
-                    extra_from_cashflow = monthly_cash_flow_gross * cashflow_to_principal_pct
+                monthly_expenses_temp = (monthly_mortgage if loan_type == "mortgage" else interest_payment) + monthly_property_tax + monthly_insurance + monthly_maintenance
+                monthly_cash_flow_temp = effective_monthly_rent - monthly_expenses_temp
+                if monthly_cash_flow_temp > 0:
+                    extra_from_cashflow = monthly_cash_flow_temp * cashflow_to_principal_pct
 
                 # Total extra principal this month
                 total_extra = extra_from_fixed + extra_from_cashflow
 
                 # Don't pay more than remaining balance
                 total_extra = min(total_extra, temp_balance - principal_payment)
+                if total_extra < 0:
+                    total_extra = 0
 
-                # Update running totals
-                principal_paid += principal_payment + total_extra
-                total_extra_principal_this_year += total_extra
+                # Update running totals - KEEP SEPARATE to avoid double-counting
+                principal_paid += principal_payment  # Only regular principal
+                total_extra_principal_this_year += total_extra  # Track extra separately
                 temp_balance -= (principal_payment + total_extra)
 
                 if temp_balance < 0:
                     temp_balance = 0
 
+        # Apply annual balloon payment at year end
+        if annual_balloon_payment > 0 and temp_balance > 0:
+            balloon_applied = min(annual_balloon_payment, temp_balance)
+            temp_balance -= balloon_applied
+            total_extra_principal_this_year += balloon_applied  # Include balloon in extra principal
+
         remaining_balance = temp_balance
         cumulative_extra_principal += total_extra_principal_this_year
 
-        # Adjust cash flow for money sent to extra principal
-        annual_cash_flow = (monthly_cash_flow_gross * 12) - total_extra_principal_this_year
-        monthly_cash_flow = annual_cash_flow / 12
+        # Calculate monthly payment amount for display (what you actually paid on average)
+        if loan_type == "mortgage":
+            avg_monthly_loan_payment = monthly_mortgage
+        else:
+            # For LOC, only show interest (extra principal shown separately)
+            avg_monthly_loan_payment = interest_paid / 12
+
+        # Calculate total monthly expenses
+        if loan_type == "mortgage":
+            monthly_expenses = monthly_mortgage + monthly_property_tax + monthly_insurance + monthly_maintenance
+        else:
+            monthly_expenses = avg_monthly_loan_payment + monthly_property_tax + monthly_insurance + monthly_maintenance
+
+        # Calculate cash flow
+        # Monthly extra principal (for display purposes)
+        monthly_extra_principal = total_extra_principal_this_year / 12
+
+        # Gross monthly cash flow (before extra principal)
+        monthly_cash_flow_gross = effective_monthly_rent - monthly_expenses
+
+        # Net monthly cash flow (after extra principal)
+        monthly_cash_flow = monthly_cash_flow_gross - monthly_extra_principal
+
+        # Annual cash flow
+        annual_cash_flow = monthly_cash_flow * 12
 
         # Equity
         equity = current_property_value - remaining_balance
@@ -154,18 +197,26 @@ def calculate_investment_projections(
             'Year': year,
             'PropertyValue': round(current_property_value, 2),
             'MonthlyRent': round(current_monthly_rent, 2),
+            'MonthlyLoanPayment': round(avg_monthly_loan_payment, 2),
+            'MonthlyPropertyTax': round(monthly_property_tax, 2),
+            'MonthlyInsurance': round(monthly_insurance, 2),
+            'MonthlyInterest': round(interest_paid / 12, 2),
+            'MonthlyMaintenance': round(monthly_maintenance, 2),
+            'TotalMonthlyExpenses': round(avg_monthly_loan_payment + monthly_property_tax + monthly_insurance + monthly_maintenance, 2),
+            'MonthlyExtraPrincipal': round(monthly_extra_principal, 2),
             'MonthlyCashFlow': round(monthly_cash_flow, 2),
             'AnnualCashFlow': round(annual_cash_flow, 2),
             'CumulativeCashFlow': round(cumulative_cash_flow, 2),
             'LoanBalance': round(remaining_balance, 2),
+            'InterestPaidThisYear': round(interest_paid, 2),
             'PrincipalPaid': round(principal_paid, 2),
             'ExtraPrincipalThisYear': round(total_extra_principal_this_year, 2),
             'CumulativeExtraPrincipal': round(cumulative_extra_principal, 2),
-            'Equity': round(equity, 2),
-            'CashOnCashReturn': round(cash_on_cash, 2),
-            'TotalROI': round(roi_pct, 2),
-            'NetProceedsIfSold': round(net_proceeds, 2),
-            'TotalProfit': round(total_profit, 2)
+            'Equity': round(equity, 2)
+            # 'CashOnCashReturn': round(cash_on_cash, 2),
+            # 'TotalROI': round(roi_pct, 2),
+            # 'NetProceedsIfSold': round(net_proceeds, 2),
+            # 'TotalProfit': round(total_profit, 2)
         })
 
     return pd.DataFrame(projections)
@@ -191,6 +242,14 @@ def render_investment_calculator():
         )
 
         st.subheader("Financing")
+
+        loan_type = st.selectbox(
+            "Loan Type",
+            ["mortgage", "line_of_credit"],
+            format_func=lambda x: "Standard Mortgage" if x == "mortgage" else "Line of Credit",
+            help="Mortgage: Fixed monthly payment. Line of Credit: Flexible payments based on cash flow"
+        )
+
         down_payment_pct = st.slider(
             "Down Payment (%)",
             min_value=0,
@@ -198,6 +257,14 @@ def render_investment_calculator():
             value=20,
             step=5
         ) / 100
+
+        closing_costs = st.number_input(
+            "Closing Costs ($)",
+            min_value=0,
+            value=0,
+            step=500,
+            help="One-time costs: title, escrow, fees, etc."
+        )
 
         interest_rate = st.number_input(
             "Interest Rate (%)",
@@ -212,7 +279,9 @@ def render_investment_calculator():
             min_value=10,
             max_value=30,
             value=30,
-            step=5
+            step=5,
+            disabled=(loan_type == "line_of_credit"),
+            help="Not applicable for Line of Credit - pay it off at your own pace" if loan_type == "line_of_credit" else "Standard mortgage term"
         )
 
         st.subheader("Monthly Expenses")
@@ -250,17 +319,25 @@ def render_investment_calculator():
             help="Additional fixed amount to pay toward principal each month"
         )
 
+        annual_balloon_payment = st.number_input(
+            "Annual Balloon Payment ($)",
+            min_value=0,
+            value=0,
+            step=1000,
+            help="Extra lump sum payment at end of each year (from external funds)"
+        )
+
         cashflow_to_principal_pct = st.slider(
             "% of Positive Cash Flow to Principal",
             min_value=0,
             max_value=100,
             value=0,
             step=5,
-            help="Automatically apply this percentage of positive cash flow to extra principal"
+            help="Apply this percentage of positive cash flow as extra principal payment (works for both mortgage and line of credit)"
         ) / 100
 
         if cashflow_to_principal_pct > 0:
-            st.info(f"💡 {cashflow_to_principal_pct*100:.0f}% of positive cash flow will be applied to principal, reducing your actual cash flow but building equity faster!")
+            st.info(f"💡 {cashflow_to_principal_pct*100:.0f}% of positive cash flow will be applied as extra principal, reducing your actual cash flow but building equity faster!")
 
     with col2:
         st.subheader("Income")
@@ -384,7 +461,10 @@ def render_investment_calculator():
             initial_repairs=total_repairs,
             ongoing_maintenance_pct=ongoing_maintenance_pct,
             extra_payment_monthly=extra_payment_monthly,
-            cashflow_to_principal_pct=cashflow_to_principal_pct
+            cashflow_to_principal_pct=cashflow_to_principal_pct,
+            loan_type=loan_type,
+            closing_costs=closing_costs,
+            annual_balloon_payment=annual_balloon_payment
         )
 
         # Display summary metrics
@@ -400,7 +480,7 @@ def render_investment_calculator():
         metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
 
         down_payment_amount = purchase_price * down_payment_pct
-        total_invested = down_payment_amount + total_repairs
+        total_invested = down_payment_amount + total_repairs + closing_costs
         final_year = projections_df.iloc[-1]
 
         with metric_col1:
@@ -411,12 +491,12 @@ def render_investment_calculator():
                 f"${final_year['PropertyValue']:,.0f}",
                 delta=f"+${final_year['PropertyValue'] - purchase_price:,.0f}"
             )
-        with metric_col3:
-            st.metric(
-                "Total Profit (if sold)",
-                f"${final_year['TotalProfit']:,.0f}",
-                delta=f"{final_year['TotalROI']:.1f}% ROI"
-            )
+        # with metric_col3:
+        #     st.metric(
+        #         "Total Profit (if sold)",
+        #         f"${final_year['TotalProfit']:,.0f}",
+        #         delta=f"{final_year['TotalROI']:.1f}% ROI"
+        #     )
         with metric_col4:
             st.metric(
                 f"Year {holding_years} Monthly Rent",
@@ -432,17 +512,25 @@ def render_investment_calculator():
         display_df = projections_df.copy()
         display_df['PropertyValue'] = display_df['PropertyValue'].apply(lambda x: f"${x:,.0f}")
         display_df['MonthlyRent'] = display_df['MonthlyRent'].apply(lambda x: f"${x:,.0f}")
+        display_df['MonthlyLoanPayment'] = display_df['MonthlyLoanPayment'].apply(lambda x: f"${x:,.0f}")
+        display_df['MonthlyPropertyTax'] = display_df['MonthlyPropertyTax'].apply(lambda x: f"${x:,.0f}")
+        display_df['MonthlyInterest'] = display_df['MonthlyInterest'].apply(lambda x: f"${x:,.0f}")
+        display_df['MonthlyInsurance'] = display_df['MonthlyInsurance'].apply(lambda x: f"${x:,.0f}")
+        display_df['MonthlyMaintenance'] = display_df['MonthlyMaintenance'].apply(lambda x: f"${x:,.0f}")
+        display_df['TotalMonthlyExpenses'] = display_df['TotalMonthlyExpenses'].apply(lambda x: f"${x:,.0f}")
+        display_df['MonthlyExtraPrincipal'] = display_df['MonthlyExtraPrincipal'].apply(lambda x: f"${x:,.0f}")
         display_df['MonthlyCashFlow'] = display_df['MonthlyCashFlow'].apply(lambda x: f"${x:,.0f}")
         display_df['AnnualCashFlow'] = display_df['AnnualCashFlow'].apply(lambda x: f"${x:,.0f}")
         display_df['CumulativeCashFlow'] = display_df['CumulativeCashFlow'].apply(lambda x: f"${x:,.0f}")
         display_df['LoanBalance'] = display_df['LoanBalance'].apply(lambda x: f"${x:,.0f}")
+        display_df['InterestPaidThisYear'] = display_df['InterestPaidThisYear'].apply(lambda x: f"${x:,.0f}")
         display_df['PrincipalPaid'] = display_df['PrincipalPaid'].apply(lambda x: f"${x:,.0f}")
         display_df['ExtraPrincipalThisYear'] = display_df['ExtraPrincipalThisYear'].apply(lambda x: f"${x:,.0f}")
         display_df['CumulativeExtraPrincipal'] = display_df['CumulativeExtraPrincipal'].apply(lambda x: f"${x:,.0f}")
         display_df['Equity'] = display_df['Equity'].apply(lambda x: f"${x:,.0f}")
-        display_df['CashOnCashReturn'] = display_df['CashOnCashReturn'].apply(lambda x: f"{x:.2f}%")
-        display_df['TotalROI'] = display_df['TotalROI'].apply(lambda x: f"{x:.2f}%")
-        display_df['TotalProfit'] = display_df['TotalProfit'].apply(lambda x: f"${x:,.0f}")
+        # display_df['CashOnCashReturn'] = display_df['CashOnCashReturn'].apply(lambda x: f"{x:.2f}%")
+        # display_df['TotalROI'] = display_df['TotalROI'].apply(lambda x: f"{x:.2f}%")
+        # display_df['TotalProfit'] = display_df['TotalProfit'].apply(lambda x: f"${x:,.0f}")
 
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 
